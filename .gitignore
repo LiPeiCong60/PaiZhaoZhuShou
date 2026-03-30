@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+.cache/
+captures/
+.template_library/
+
+.env
+.env.*
+
+*.log
+*.tmp
