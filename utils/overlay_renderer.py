@@ -103,7 +103,7 @@ class OverlayRenderer:
             cv2.circle(frame, (ax, ay), 6, (0, 255, 0), -1)
             cv2.line(frame, (ax - 12, ay), (ax + 12, ay), (0, 255, 0), 2)
             cv2.line(frame, (ax, ay - 12), (ax, ay + 12), (0, 255, 0), 2)
-            text_items.append(("肩部锚点", (max(10, ax - 60), max(25, ay - 15)), (0, 255, 0), 0.5, 2))
+            text_items.append(("构图锚点", (max(10, ax - 60), max(25, ay - 15)), (0, 255, 0), 0.5, 2))
 
         text_items.append(
             (

@@ -15,9 +15,7 @@ FOLLOW_TEXT = {
 
 SPEED_TEXT = {
     "slow": "慢速",
-    "normal": "正常",
-    "fast": "快速",
-    "turbo": "极速",
+    "normal": "标准",
 }
 
 DETECTION_LABEL_TEXT = {

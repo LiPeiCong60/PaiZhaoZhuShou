@@ -30,7 +30,8 @@ POSE_EDGES: list[tuple[int, int]] = [
     (28, 32),
 ]
 
-POSE_KEYPOINT_IDS: tuple[int, ...] = (11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
+# Include head-related keypoints (nose/ears) for head-anchor fallback.
+POSE_KEYPOINT_IDS: tuple[int, ...] = (0, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
 
 FACE_POLYLINES: list[list[int]] = [
     [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10],  # face oval
@@ -240,13 +241,43 @@ class MediaPipeVisionDetector(VisionDetector):
                 for idx in POSE_KEYPOINT_IDS:
                     if idx >= len(lm):
                         continue
+                    if not (0.0 <= lm[idx].x <= 1.0 and 0.0 <= lm[idx].y <= 1.0):
+                        continue
                     pose_landmarks[idx] = Point(x=lm[idx].x * w, y=lm[idx].y * h)
-                anchor = None
-                if len(lm) > 12:
+                l_sh = lm[11] if len(lm) > 12 else None
+                r_sh = lm[12] if len(lm) > 12 else None
+                nose = lm[0] if len(lm) > 0 else None
+                l_ok = (
+                    l_sh is not None
+                    and l_sh.visibility >= 0.45
+                    and 0.0 <= l_sh.x <= 1.0
+                    and 0.0 <= l_sh.y <= 1.0
+                )
+                r_ok = (
+                    r_sh is not None
+                    and r_sh.visibility >= 0.45
+                    and 0.0 <= r_sh.x <= 1.0
+                    and 0.0 <= r_sh.y <= 1.0
+                )
+                if l_ok and r_ok:
                     anchor = Point(
-                        x=(lm[11].x + lm[12].x) * 0.5 * w,
-                        y=(lm[11].y + lm[12].y) * 0.5 * h,
+                        x=((l_sh.x + r_sh.x) * 0.5) * w,
+                        y=((l_sh.y + r_sh.y) * 0.5) * h,
                     )
+                elif l_ok:
+                    anchor = Point(x=l_sh.x * w, y=l_sh.y * h)
+                elif r_ok:
+                    anchor = Point(x=r_sh.x * w, y=r_sh.y * h)
+                elif (
+                    nose is not None
+                    and nose.visibility >= 0.45
+                    and 0.0 <= nose.x <= 1.0
+                    and 0.0 <= nose.y <= 1.0
+                ):
+                    anchor = Point(x=nose.x * w, y=nose.y * h)
+                else:
+                    anchor = None
+
                 candidates.append(
                     DetectionResult(
                         bbox=bbox,
@@ -424,7 +455,7 @@ class MediaPipeVisionDetector(VisionDetector):
         xs: list[int] = []
         ys: list[int] = []
         for lm in landmarks:
-            if lm.visibility < 0.45:
+            if lm.visibility < 0.35:
                 continue
             x = int(lm.x * w)
             y = int(lm.y * h)
@@ -477,16 +508,44 @@ class MediaPipeVisionDetector(VisionDetector):
                 continue
             l_sh = landmarks[11]
             r_sh = landmarks[12]
+            nose = landmarks[0]
+            l_ok = (
+                l_sh.visibility >= 0.35
+                and 0.0 <= l_sh.x <= 1.0
+                and 0.0 <= l_sh.y <= 1.0
+            )
+            r_ok = (
+                r_sh.visibility >= 0.35
+                and 0.0 <= r_sh.x <= 1.0
+                and 0.0 <= r_sh.y <= 1.0
+            )
             anchor: Point | None = None
-            if l_sh.visibility >= 0.45 and r_sh.visibility >= 0.45:
+            if l_ok and r_ok:
                 anchor = Point(
-                    x=(l_sh.x + r_sh.x) * 0.5 * w,
-                    y=(l_sh.y + r_sh.y) * 0.5 * h,
+                    x=((l_sh.x + r_sh.x) * 0.5) * w,
+                    y=((l_sh.y + r_sh.y) * 0.5) * h,
                 )
+            elif l_ok:
+                anchor = Point(x=l_sh.x * w, y=l_sh.y * h)
+            elif r_ok:
+                anchor = Point(x=r_sh.x * w, y=r_sh.y * h)
+            elif (
+                nose.visibility >= 0.35
+                and 0.0 <= nose.x <= 1.0
+                and 0.0 <= nose.y <= 1.0
+            ):
+                anchor = Point(x=nose.x * w, y=nose.y * h)
+            if anchor is None:
+                anchor = bbox.center
+                
             pose_landmarks: dict[int, Point] = {}
             for idx in POSE_KEYPOINT_IDS:
                 lm = landmarks[idx]
                 if lm.visibility < 0.35:
+                    continue
+                # Skip landmarks outside the valid frame area – MediaPipe may
+                # extrapolate positions for partially-visible body parts.
+                if not (0.0 <= lm.x <= 1.0 and 0.0 <= lm.y <= 1.0):
                     continue
                 pose_landmarks[idx] = Point(x=lm.x * w, y=lm.y * h)
             candidates.append(
@@ -617,8 +676,14 @@ class MediaPipeYoloVisionDetector(VisionDetector):
             yolo_bbox = self._last_yolo_bbox
             yolo_conf = self._last_yolo_conf
 
+        candidates = list(mp_result.tracking_candidates or [])
+        if candidates and yolo_bbox is not None:
+            candidates.sort(
+                key=lambda det: self._candidate_rank(det, yolo_bbox, frame.shape[1], frame.shape[0]),
+                reverse=True,
+            )
         person_bbox = yolo_bbox if yolo_bbox is not None else mp_result.person_bbox
-        tracking_detection = mp_result.tracking_detection
+        tracking_detection = candidates[0] if candidates else mp_result.tracking_detection
         if tracking_detection is not None and person_bbox is not None:
             tracking_detection = DetectionResult(
                 bbox=person_bbox,
@@ -630,7 +695,7 @@ class MediaPipeYoloVisionDetector(VisionDetector):
 
         return VisionResult(
             tracking_detection=tracking_detection,
-            tracking_candidates=mp_result.tracking_candidates,
+            tracking_candidates=candidates or mp_result.tracking_candidates,
             face_tracking_detection=mp_result.face_tracking_detection,
             person_bbox=person_bbox,
             face_bbox=mp_result.face_bbox,
@@ -639,6 +704,34 @@ class MediaPipeYoloVisionDetector(VisionDetector):
             hand_landmarks=mp_result.hand_landmarks,
             hand_handedness=mp_result.hand_handedness,
         )
+
+    @staticmethod
+    def _candidate_rank(det: DetectionResult, yolo_bbox: BBox, frame_w: int, frame_h: int) -> float:
+        iou = MediaPipeYoloVisionDetector._bbox_iou(det.bbox, yolo_bbox)
+        pose_landmarks = det.pose_landmarks or {}
+        keypoint_ratio = min(1.0, len(pose_landmarks) / 10.0)
+        shoulder_bonus = 0.12 if 11 in pose_landmarks and 12 in pose_landmarks else 0.0
+        head_bonus = 0.06 if 0 in pose_landmarks or 7 in pose_landmarks or 8 in pose_landmarks else 0.0
+        area_ratio = det.bbox.area / float(max(1, frame_w * frame_h))
+        area_score = min(1.0, area_ratio / 0.22)
+        conf_score = max(0.0, min(1.0, float(det.confidence)))
+        return iou * 0.58 + keypoint_ratio * 0.2 + area_score * 0.1 + conf_score * 0.06 + shoulder_bonus + head_bonus
+
+    @staticmethod
+    def _bbox_iou(a: BBox, b: BBox) -> float:
+        ax1, ay1 = float(a.x), float(a.y)
+        bx1, by1 = float(b.x), float(b.y)
+        ax2, ay2 = ax1 + float(a.w), ay1 + float(a.h)
+        bx2, by2 = bx1 + float(b.w), by1 + float(b.h)
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        union = float(a.w * a.h + b.w * b.h) - inter
+        if union <= 1e-6:
+            return 0.0
+        return max(0.0, min(1.0, inter / union))
 
     @staticmethod
     def _smooth_bbox(

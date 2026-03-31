@@ -42,15 +42,16 @@ class GimbalConfig:
 
 @dataclass(slots=True)
 class TrackingConfig:
-    deadzone_px: int = 45
-    debounce_frames: int = 4
-    gain_x: float = 0.018
-    gain_y: float = 0.018
-    max_delta_deg: float = 2.2
+    deadzone_px: int = 30
+    debounce_frames: int = 2
+    gain_x: float = 0.024
+    gain_y: float = 0.024
+    max_delta_deg: float = 2.8
     min_command_interval_s: float = 0.08
-    command_smooth_alpha: float = 0.35
-    min_output_deg: float = 0.15
+    command_smooth_alpha: float = 0.4
+    min_output_deg: float = 0.1
     max_anchor_jump_px: float = 120.0
+    settle_after_move_s: float = 0.18
     invert_pan: bool = False
     invert_tilt: bool = False
 

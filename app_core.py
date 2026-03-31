@@ -14,15 +14,15 @@ from interfaces.capture_trigger import CaptureTrigger
 from interfaces.target_strategy import TargetPreset, build_target_strategy
 from mode_manager import ControlMode, ModeManager
 from tracking_controller import TrackingController
-from utils.common_types import DetectionResult, VisionResult
+from utils.common_types import DetectionResult, Point, VisionResult
 from utils.ui_text import FOLLOW_TEXT, SPEED_TEXT, follow_to_text, speed_to_text
 
 # ---------------------------------------------------------------------------
 # Detection thresholds
 # ---------------------------------------------------------------------------
 MIN_DETECTION_AREA_RATIO = 0.015
-MIN_DETECTION_CONFIDENCE = 0.72
-RELIABLE_STREAK_FOR_TRACKING = 6
+MIN_DETECTION_CONFIDENCE = 0.60
+RELIABLE_STREAK_FOR_TRACKING = 3
 
 # ---------------------------------------------------------------------------
 # Template overlay skeleton edges
@@ -72,9 +72,29 @@ class TargetSelector:
 
     def select(self, vision: VisionResult, follow_mode: str) -> DetectionResult | None:
         if follow_mode == "face":
-            det = vision.face_tracking_detection
-            self._last_center = (det.bbox.center.x, det.bbox.center.y) if det is not None else None
-            return det
+            candidates = vision.tracking_candidates or []
+            if not candidates:
+                base = vision.tracking_detection
+                if base is None:
+                    self._last_center = None
+                    return None
+                det = self._with_head_anchor(base)
+                self._last_center = (det.bbox.center.x, det.bbox.center.y)
+                return det
+            head_candidates = [self._with_head_anchor(c) for c in candidates]
+            if self._last_center is None:
+                best = max(head_candidates, key=lambda d: d.bbox.area)
+            else:
+                best = min(
+                    head_candidates,
+                    key=lambda d: (
+                        (d.anchor_point.x - self._last_center[0]) ** 2
+                        + (d.anchor_point.y - self._last_center[1]) ** 2,
+                        -d.bbox.area,
+                    ),
+                )
+            self._last_center = (best.anchor_point.x, best.anchor_point.y)
+            return best
         candidates = vision.tracking_candidates or []
         if not candidates:
             det = vision.tracking_detection
@@ -94,6 +114,40 @@ class TargetSelector:
         self._last_center = (best.bbox.center.x, best.bbox.center.y)
         return best
 
+    @staticmethod
+    def _with_head_anchor(base: DetectionResult) -> DetectionResult:
+        anchor = _head_anchor_from_detection(base)
+        if anchor is None:
+            anchor = base.bbox.center
+        return DetectionResult(
+            bbox=base.bbox,
+            confidence=base.confidence,
+            label="head_pose_fallback",
+            track_id=base.track_id,
+            anchor_point=anchor,
+            pose_landmarks=base.pose_landmarks,
+        )
+
+
+def _head_anchor_from_detection(detection: DetectionResult) -> Point | None:
+    pose = detection.pose_landmarks or {}
+    nose = pose.get(0)
+    left_ear = pose.get(7)
+    right_ear = pose.get(8)
+    if nose is not None:
+        return Point(x=float(nose.x), y=float(nose.y))
+    if left_ear is not None and right_ear is not None:
+        return Point(
+            x=(float(left_ear.x) + float(right_ear.x)) * 0.5,
+            y=(float(left_ear.y) + float(right_ear.y)) * 0.5,
+        )
+    if left_ear is not None:
+        return Point(x=float(left_ear.x), y=float(left_ear.y))
+    if right_ear is not None:
+        return Point(x=float(right_ear.x), y=float(right_ear.y))
+    b = detection.bbox
+    return Point(x=float(b.center.x), y=float(b.y + b.h * 0.18))
+
 
 # ---------------------------------------------------------------------------
 # Pure functions
@@ -102,15 +156,27 @@ def reliable_detection(
     detection: DetectionResult | None, frame_shape: tuple[int, int, int]
 ) -> DetectionResult | None:
     """Filter out unreliable detections by area ratio and confidence."""
-    if detection is None or detection.anchor_point is None:
+    if detection is None:
         return None
-    if detection.label not in {"person_pose", "person_mp_yolo", "face_center"}:
+    if detection.label not in {"person_pose", "person_mp_yolo", "face_center", "head_pose_fallback"}:
         return None
     h, w = frame_shape[:2]
     area_ratio = detection.bbox.area / float(max(1, h * w))
     if area_ratio < MIN_DETECTION_AREA_RATIO:
         return None
-    return detection if detection.confidence >= MIN_DETECTION_CONFIDENCE else None
+    if detection.confidence < MIN_DETECTION_CONFIDENCE:
+        return None
+    if detection.anchor_point is not None:
+        return detection
+    # Fallback anchor to keep tracking stable when shoulders/nose are briefly lost.
+    return DetectionResult(
+        bbox=detection.bbox,
+        confidence=detection.confidence,
+        label=detection.label,
+        track_id=detection.track_id,
+        anchor_point=detection.bbox.center,
+        pose_landmarks=detection.pose_landmarks,
+    )
 
 
 def build_draw_vision(vision: VisionResult, reliable: DetectionResult | None) -> VisionResult:

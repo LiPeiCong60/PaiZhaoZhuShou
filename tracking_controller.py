@@ -5,7 +5,7 @@ from math import hypot
 
 from config import TrackingConfig
 from interfaces.target_strategy import TargetStrategy
-from utils.common_types import DetectionResult, GimbalCommand
+from utils.common_types import DetectionResult, GimbalCommand, Point
 
 
 class TrackingController:
@@ -26,9 +26,12 @@ class TrackingController:
         self._off_center_frames = 0
 
     def set_speed_mode(self, mode: str) -> None:
-        # Unified table avoids scattered branch constants.
-        speed_map = {"slow": 0.8, "normal": 1.0, "fast": 2.4, "turbo": 3.2}
-        self._speed_scale = speed_map.get(mode, 1.0)
+        speed_map = {"slow": 0.7, "normal": 1.0}
+        self._speed_scale = speed_map.get(mode, speed_map["normal"])
+
+    @property
+    def settle_after_move_s(self) -> float:
+        return float(self._config.settle_after_move_s)
 
     def get_target_point(self, frame_shape: tuple[int, int, int]) -> tuple[int, int]:
         point = self._target_strategy.get_target_point(frame_shape)
@@ -38,6 +41,7 @@ class TrackingController:
         self,
         frame_shape: tuple[int, int, int],
         detection: DetectionResult | None,
+        target_override: Point | None = None,
     ) -> GimbalCommand | None:
         if detection is None:
             self._off_center_frames = 0
@@ -46,7 +50,7 @@ class TrackingController:
             self._last_tilt_cmd = 0.0
             return None
 
-        target = self._target_strategy.get_target_point(frame_shape)
+        target = target_override if target_override is not None else self._target_strategy.get_target_point(frame_shape)
         center = detection.anchor_point if detection.anchor_point is not None else detection.bbox.center
         cx, cy = center.x, center.y
 
@@ -56,7 +60,7 @@ class TrackingController:
                 # Drop sudden outlier to avoid servo snapping.
                 self._last_anchor = (cx, cy)
                 return None
-            a = self._config.command_smooth_alpha
+            a = min(0.55, max(0.2, self._config.command_smooth_alpha * 1.2))
             cx = self._last_anchor[0] * (1 - a) + cx * a
             cy = self._last_anchor[1] * (1 - a) + cy * a
         self._last_anchor = (cx, cy)
@@ -90,6 +94,13 @@ class TrackingController:
             raw_pan = -raw_pan
         if self._config.invert_tilt:
             raw_tilt = -raw_tilt
+
+        # Suppress rapid command sign flips near center to reduce "hunting" jitter.
+        reverse_guard_px = float(self._config.deadzone_px) * 1.9
+        if self._last_pan_cmd * raw_pan < 0 and abs(offset_x) <= reverse_guard_px:
+            raw_pan = 0.0
+        if self._last_tilt_cmd * raw_tilt < 0 and abs(offset_y) <= reverse_guard_px:
+            raw_tilt = 0.0
 
         sa = self._config.command_smooth_alpha
         pan_delta = self._last_pan_cmd * (1 - sa) + raw_pan * sa

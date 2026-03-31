@@ -4,6 +4,7 @@ import argparse
 import logging
 import math
 import os
+import queue
 import tempfile
 import threading
 import time
@@ -136,6 +137,7 @@ class GuiApp:
         self._reliable_detection_streak = 0
         self._last_submit_ts = 0.0
         self._last_preview_ts = 0.0
+        self._tracking_hold_until = 0.0
         self._last_detector_error_ts = 0.0
         self._render_rate = EventRateCounter()
         self._detect_rate = EventRateCounter()
@@ -151,6 +153,10 @@ class GuiApp:
         self._pending_capture_metadata: dict[str, object] | None = None
         self._last_countdown_log_s = -1
         self._template_preview_photo = None
+        self._bg_task_queue: queue.Queue[tuple[Callable[[], Any], Callable[[Any], None] | None, Callable[[Exception], None] | None]] = queue.Queue()
+        self._bg_task_count = 0
+        self._bg_task_lock = threading.Lock()
+        self._ai_control_buttons: list[tk.Widget] = []
 
 
         self._tracking.set_speed_mode(self._speed_mode)
@@ -205,6 +211,8 @@ class GuiApp:
         self._pil_image_tk = ImageTk
 
         self._build_ui()
+        self._bg_worker = threading.Thread(target=self._bg_worker_loop, daemon=True, name="ai-bg-worker")
+        self._bg_worker.start()
         self._schedule_tick()
 
     def _build_ui(self) -> None:
@@ -257,11 +265,17 @@ class GuiApp:
         ttk.Button(util_box, text="抓拍", command=lambda: self._run_cmd("capture")).grid(row=1, column=0, sticky="ew", pady=2)
         ttk.Button(util_box, text="上传模板", command=self._upload_template).grid(row=2, column=0, sticky="ew", pady=2)
         ttk.Button(util_box, text="删除模板", command=self._delete_template).grid(row=3, column=0, sticky="ew", pady=2)
-        ttk.Button(util_box, text="上传评分", command=self._upload_and_score_photo).grid(row=4, column=0, sticky="ew", pady=2)
-        ttk.Button(util_box, text="背景分析(上传)", command=self._upload_and_analyze_background).grid(row=5, column=0, sticky="ew", pady=2)
-        ttk.Button(util_box, text="模板+背景指导", command=self._guide_with_template_background).grid(row=6, column=0, sticky="ew", pady=2)
-        ttk.Button(util_box, text="AI自动找角度", command=self._start_ai_angle_search).grid(row=7, column=0, sticky="ew", pady=2)
-        ttk.Button(util_box, text="现场背景并锁机位", command=self._analyze_background_and_lock).grid(row=8, column=0, sticky="ew", pady=2)
+        btn_upload_score = ttk.Button(util_box, text="上传评分", command=self._upload_and_score_photo)
+        btn_upload_score.grid(row=4, column=0, sticky="ew", pady=2)
+        btn_bg_upload = ttk.Button(util_box, text="背景分析(上传)", command=self._upload_and_analyze_background)
+        btn_bg_upload.grid(row=5, column=0, sticky="ew", pady=2)
+        btn_template_bg = ttk.Button(util_box, text="模板+背景指导", command=self._guide_with_template_background)
+        btn_template_bg.grid(row=6, column=0, sticky="ew", pady=2)
+        btn_ai_angle = ttk.Button(util_box, text="AI自动找角度", command=self._start_ai_angle_search)
+        btn_ai_angle.grid(row=7, column=0, sticky="ew", pady=2)
+        btn_bg_lock = ttk.Button(util_box, text="现场背景并锁机位", command=self._analyze_background_and_lock)
+        btn_bg_lock.grid(row=8, column=0, sticky="ew", pady=2)
+        self._ai_control_buttons.extend([btn_upload_score, btn_bg_upload, btn_template_bg, btn_ai_angle, btn_bg_lock])
         ttk.Button(util_box, text="解除机位锁定", command=self._unlock_ai_lock_mode).grid(row=9, column=0, sticky="ew", pady=2)
         ttk.Checkbutton(
             util_box,
@@ -529,28 +543,8 @@ class GuiApp:
             )
             TemplateComposeEngine.SCORE_THRESHOLD = float(self._compose_score_threshold_var.get())
 
-            if (
-                self._mode_manager.mode in {ControlMode.AUTO_TRACK, ControlMode.SMART_COMPOSE}
-                and stable is not None
-                and self._reliable_detection_streak >= RELIABLE_STREAK_FOR_TRACKING
-            ):
-                should_auto_move = (
-                    self._mode_manager.mode == ControlMode.AUTO_TRACK
-                    or bool(self._compose_auto_control.get())
-                )
-                if self._ai_lock_mode_enabled:
-                    should_auto_move = False
-                if should_auto_move:
-                    command = self._tracking.compute_command(frame.shape, stable)
-                    if command is not None:
-                        self._gimbal.move_relative(command.pan_delta, command.tilt_delta, smooth=True)
-
-            if self._ai_lock_mode_enabled and self._ai_lock_target_box_norm is not None and stable is not None:
-                self._ai_lock_fit_score = self._compute_lock_fit_score(stable.bbox, frame.shape)
-            else:
-                self._ai_lock_fit_score = 0.0
-
             compose_feedback = None
+            compose_target_override = None
             ready_for_gesture = False
             allow_open_fist_capture = False
             selected_template = self._template_library.get(self._selected_template_id or "")
@@ -563,7 +557,16 @@ class GuiApp:
                     selected_template,
                     stable,
                     frame.shape,
-                    mirror_template=False,
+                    mirror_template=self._is_mirror_view_enabled(),
+                    follow_mode=self._follow_mode,
+                )
+                target_x_norm = float(compose_feedback.target_norm[0])
+                target_y_norm = float(compose_feedback.target_norm[1])
+                if self._is_mirror_view_enabled():
+                    target_x_norm = 1.0 - target_x_norm
+                compose_target_override = Point(
+                    x=max(0.0, min(float(frame.shape[1] - 1), target_x_norm * frame.shape[1])),
+                    y=max(0.0, min(float(frame.shape[0] - 1), target_y_norm * frame.shape[0])),
                 )
                 self._last_compose_feedback = compose_feedback
                 if compose_feedback.ready:
@@ -583,6 +586,37 @@ class GuiApp:
                 self._ready_since_ts = 0.0
                 self._last_compose_feedback = None
                 allow_open_fist_capture = True
+
+            if (
+                self._mode_manager.mode in {ControlMode.AUTO_TRACK, ControlMode.SMART_COMPOSE}
+                and stable is not None
+                and self._reliable_detection_streak >= RELIABLE_STREAK_FOR_TRACKING
+            ):
+                should_auto_move = (
+                    self._mode_manager.mode == ControlMode.AUTO_TRACK
+                    or bool(self._compose_auto_control.get())
+                )
+                if self._ai_lock_mode_enabled:
+                    should_auto_move = False
+                if should_auto_move and now >= self._tracking_hold_until:
+                    target_override = (
+                        compose_target_override
+                        if self._mode_manager.mode == ControlMode.SMART_COMPOSE
+                        else None
+                    )
+                    command = self._tracking.compute_command(
+                        frame.shape,
+                        stable,
+                        target_override=target_override,
+                    )
+                    if command is not None:
+                        self._gimbal.move_relative(command.pan_delta, command.tilt_delta, smooth=True)
+                        self._tracking_hold_until = now + self._tracking.settle_after_move_s
+
+            if self._ai_lock_mode_enabled and self._ai_lock_target_box_norm is not None and stable is not None:
+                self._ai_lock_fit_score = self._compute_lock_fit_score(stable.bbox, frame.shape)
+            else:
+                self._ai_lock_fit_score = 0.0
 
             if not bool(self._gesture_capture_enabled.get()):
                 allow_open_fist_capture = False
@@ -1169,17 +1203,46 @@ class GuiApp:
         on_success: Callable[[Any], None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
-        def runner() -> None:
+        with self._bg_task_lock:
+            self._bg_task_count += 1
+        self._set_ai_controls_enabled(False)
+        self._bg_task_queue.put((work, on_success, on_error))
+
+    def _bg_worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                work, on_success, on_error = self._bg_task_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
             try:
                 result = work()
             except Exception as exc:
                 if on_error is not None:
-                    self._root.after(0, lambda e=exc: on_error(e))
-                return
-            if on_success is not None:
-                self._root.after(0, lambda r=result: on_success(r))
+                    self._safe_ui_call(lambda e=exc: on_error(e))
+            else:
+                if on_success is not None:
+                    self._safe_ui_call(lambda r=result: on_success(r))
+            finally:
+                with self._bg_task_lock:
+                    self._bg_task_count = max(0, self._bg_task_count - 1)
+                    no_pending = self._bg_task_count == 0
+                if no_pending:
+                    self._safe_ui_call(lambda: self._set_ai_controls_enabled(True))
+                self._bg_task_queue.task_done()
 
-        threading.Thread(target=runner, daemon=True).start()
+    def _safe_ui_call(self, callback: Callable[[], None]) -> None:
+        try:
+            self._root.after(0, callback)
+        except Exception:
+            pass
+
+    def _set_ai_controls_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for btn in self._ai_control_buttons:
+            try:
+                btn.configure(state=state)
+            except Exception:
+                continue
 
     @staticmethod
     def _pick_image_file(title: str) -> str:
@@ -1220,12 +1283,6 @@ class GuiApp:
         self._selected_template_id = templates[selected_idx].template_id
         template = templates[selected_idx]
         self._update_template_preview(template.image_path)
-        self._tracking.set_target_strategy(
-            build_target_strategy(
-                TargetPreset.CUSTOM_POINT,
-                custom=(template.anchor_norm_x, template.anchor_norm_y),
-            )
-        )
 
     def _on_template_selected(self) -> None:
         templates = self._template_library.list_templates()
@@ -1233,12 +1290,6 @@ class GuiApp:
         for t in templates:
             if current.startswith(f"{t.name} ("):
                 self._selected_template_id = t.template_id
-                self._tracking.set_target_strategy(
-                    build_target_strategy(
-                        TargetPreset.CUSTOM_POINT,
-                        custom=(t.anchor_norm_x, t.anchor_norm_y),
-                    )
-                )
                 self._update_template_preview(t.image_path)
                 self._append_log(f"已选择模板: {t.name}")
                 return
@@ -1260,7 +1311,7 @@ class GuiApp:
         name = os.path.splitext(os.path.basename(path))[0]
         profile = self._template_engine.create_profile(name, path, detection, image.shape)
         if profile is None:
-            self._append_log("模板创建失败: 无法提取完整姿态，请换一张全身更清晰的照片")
+            self._append_log("模板创建失败: 未检测到有效人物区域，请更换照片后重试")
             return
         self._template_library.add(profile)
         self._selected_template_id = profile.template_id
@@ -1299,12 +1350,11 @@ class GuiApp:
         tx = int(feedback.target_norm[0] * w)
         ty = int(feedback.target_norm[1] * h)
         cv2.circle(frame, (tx, ty), 11, (0, 255, 255), 2)
-        dx = -feedback.offset_norm[0] if mirror_view else feedback.offset_norm[0]
-        ox = int(tx - dx * w)
+        ox = int(tx - feedback.offset_norm[0] * w)
         oy = int(ty - feedback.offset_norm[1] * h)
         cv2.arrowedLine(frame, (ox, oy), (tx, ty), (255, 80, 30), 2, tipLength=0.16)
         if template_profile is not None and template_profile.pose_points:
-            projected = self._project_template_pose(template_profile, frame.shape)
+            projected = self._project_template_pose(template_profile, frame.shape, mirror_view=mirror_view)
             if bool(self._show_template_lines.get()):
                 for s, e in TEMPLATE_CORE_EDGES:
                     if s in projected and e in projected:
@@ -1320,6 +1370,8 @@ class GuiApp:
                     by = float(bbox_norm[1])
                     bw_norm = float(bbox_norm[2])
                     bh_norm = float(bbox_norm[3])
+                    if mirror_view:
+                        bx = 1.0 - bx - bw_norm
                     x = int(max(0, min(w - 2, bx * w)))
                     y = int(max(0, min(h - 2, by * h)))
                     bw = int(max(2, min(w - x, bw_norm * w)))
@@ -1407,15 +1459,35 @@ class GuiApp:
         return max(0.0, min(1.0, inter / union))
 
     def _project_template_pose(
-        self, template_profile, frame_shape: tuple[int, int, int]
+        self, template_profile, frame_shape: tuple[int, int, int], *, mirror_view: bool = False
     ) -> dict[int, tuple[int, int]]:
         h, w = frame_shape[:2]
         points: dict[int, tuple[int, int]] = {}
+        bbox_norm = getattr(template_profile, "bbox_norm", (0.0, 0.0, 0.0, 0.0))
+        src_bbox = getattr(template_profile, "pose_points_bbox", None) or {}
+        if src_bbox and len(bbox_norm) == 4 and bbox_norm[2] > 0 and bbox_norm[3] > 0:
+            bx = float(bbox_norm[0])
+            by = float(bbox_norm[1])
+            bw_norm = float(bbox_norm[2])
+            bh_norm = float(bbox_norm[3])
+            if mirror_view:
+                bx = 1.0 - bx - bw_norm
+            x0 = bx * w
+            y0 = by * h
+            bw = bw_norm * w
+            bh = bh_norm * h
+            for idx, (nx, ny) in src_bbox.items():
+                px = 1.0 - float(nx) if mirror_view else float(nx)
+                x = int(max(0, min(w - 1, x0 + px * bw)))
+                y = int(max(0, min(h - 1, y0 + float(ny) * bh)))
+                points[int(idx)] = (x, y)
+            return points
         src = getattr(template_profile, "pose_points_image", None) or {}
         if src:
             for idx, (nx, ny) in src.items():
-                x = int(max(0, min(w - 1, nx * w)))
-                y = int(max(0, min(h - 1, ny * h)))
+                px = 1.0 - float(nx) if mirror_view else float(nx)
+                x = int(max(0, min(w - 1, px * w)))
+                y = int(max(0, min(h - 1, float(ny) * h)))
                 points[int(idx)] = (x, y)
             return points
         # Backward compatibility for old templates without image-normalized points.
@@ -1424,7 +1496,8 @@ class GuiApp:
         approx_size = math.sqrt(max(1.0, template_profile.area_ratio * w * h))
         scale = max(40.0, approx_size * 2.1)
         for idx, (nx, ny) in template_profile.pose_points.items():
-            x = int(max(0, min(w - 1, cx + nx * scale)))
+            px = -float(nx) if mirror_view else float(nx)
+            x = int(max(0, min(w - 1, cx + px * scale)))
             y = int(max(0, min(h - 1, cy + ny * scale)))
             points[int(idx)] = (x, y)
         return points
