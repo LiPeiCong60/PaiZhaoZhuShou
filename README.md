@@ -43,3 +43,7 @@ $env:SILICONFLOW_MODEL="Pro/OpenGVLab/InternVL2.5-73B"
 
 - [一键上手：用户使用指南](docs/USER_GUIDE.md)
 - [架构解析：项目开发技术文档](docs/PROJECT_DOCUMENTATION.md)
+- [联动对接：接口与接入方案](docs/INTEGRATION_API_PLAN.md)
+- [重构计划：安全重构任务文档](docs/REFACTOR_TASKS.md)
+- [API快速入门](docs/API_QUICKSTART.md)
+- [冒烟检查清单](docs/SMOKE_CHECKLIST.md)

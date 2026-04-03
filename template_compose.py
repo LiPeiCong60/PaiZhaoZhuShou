@@ -320,11 +320,16 @@ class GestureCaptureState:
         self._stable_frames = max(2, int(stable_frames))
         self._open_hold_min_s = max(0.05, float(open_hold_min_s))
 
-    def reset(self) -> None:
+    def reset_pose_capture(self) -> None:
         self._phase = "idle"
         self._open_deadline = 0.0
         self._open_min_hold_until = 0.0
-        self._counts = {"open": 0, "fist": 0, "ok": 0}
+        self._counts["open"] = 0
+        self._counts["fist"] = 0
+
+    def reset(self) -> None:
+        self.reset_pose_capture()
+        self._counts["ok"] = 0
 
     def update(
         self,
@@ -349,7 +354,7 @@ class GestureCaptureState:
             return "force_capture"
 
         if not ready_for_pose_capture:
-            self.reset()
+            self.reset_pose_capture()
             return None
 
         if self._phase == "idle":

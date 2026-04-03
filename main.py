@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -53,6 +54,15 @@ from utils.ui_text import (
     speed_to_text,
 )
 from video_source import OpenCVVideoSource
+
+# 导入服务层
+from services.control_service import ControlService
+from services.template_service import TemplateService
+from services.capture_service import CaptureService
+from services.ai_orchestrator import AIOrchestrator
+from services.status_service import StatusService
+from services.runtime_state import RuntimeState
+from repositories.local_template_repository import LocalTemplateRepository
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,7 +140,46 @@ class GuiApp:
         self._preview_scale = min(1.0, max(0.2, preview_scale))
         self._mirror_view = mirror_view
         self._ai_assistant = ai_assistant or build_ai_assistant_from_env()
+        self._runtime_state = RuntimeState()
 
+        # 初始化服务层
+        self._template_library = TemplateLibrary()
+        template_repository = LocalTemplateRepository(self._template_library)
+
+        self._control_service = ControlService(
+            mode_manager=self._mode_manager,
+            tracking=self._tracking,
+            gimbal=self._gimbal,
+            runtime_state=self._runtime_state,
+            manual_step_deg=self._manual_step_deg,
+        )
+
+        self._capture_service = CaptureService(
+            capture_trigger=self._capture_trigger,
+            ai_assistant=self._ai_assistant,
+            runtime_state=self._runtime_state,
+        )
+
+        self._template_service = TemplateService(
+            repository=template_repository,
+            runtime_state=self._runtime_state,
+        )
+
+        self._ai_orchestrator = AIOrchestrator(
+            ai_assistant=self._ai_assistant,
+            control_service=self._control_service,
+            capture_service=self._capture_service,
+            runtime_state=self._runtime_state,
+            frame_provider=self._source.read,
+            capture_frame_for_save=self._capture_frame_for_save,
+        )
+
+        self._status_service = StatusService(
+            mode_manager=self._mode_manager,
+            runtime_state=self._runtime_state,
+        )
+
+        # 状态变量
         self._stop_event = threading.Event()
         self._follow_mode = "shoulders"
         self._speed_mode = "normal"
@@ -142,7 +191,6 @@ class GuiApp:
         self._render_rate = EventRateCounter()
         self._detect_rate = EventRateCounter()
         self._target_selector = TargetSelector()
-        self._template_library = TemplateLibrary()
         self._template_engine = TemplateComposeEngine()
         self._gesture_state = GestureCaptureState()
         self._selected_template_id: str | None = None
@@ -157,7 +205,6 @@ class GuiApp:
         self._bg_task_count = 0
         self._bg_task_lock = threading.Lock()
         self._ai_control_buttons: list[tk.Widget] = []
-
 
         self._tracking.set_speed_mode(self._speed_mode)
         self._overlay = OverlayRenderer(
@@ -188,6 +235,7 @@ class GuiApp:
         self._ai_scan_tilt_step = tk.DoubleVar(master=self._root, value=3.0)
         self._ai_scan_max_candidates = tk.IntVar(master=self._root, value=9)
         self._ai_scan_settle_s = tk.DoubleVar(master=self._root, value=0.35)
+        self._ai_angle_countdown_s = tk.IntVar(master=self._root, value=0)
         self._bg_capture_delay_s = tk.DoubleVar(master=self._root, value=3.0)
         self._gesture_countdown_s = tk.DoubleVar(master=self._root, value=3.0)
         self._gesture_stable_frames_var = tk.IntVar(master=self._root, value=10)
@@ -202,6 +250,7 @@ class GuiApp:
         self._show_template_bbox = tk.BooleanVar(master=self._root, value=False)
         self._live_overlay_alpha = tk.DoubleVar(master=self._root, value=0.85)
         self._template_overlay_alpha = tk.DoubleVar(master=self._root, value=0.7)
+        self._ui_settings_path = os.path.join(".cache", "ui_settings.json")
 
         try:
             from PIL import Image, ImageTk
@@ -211,9 +260,98 @@ class GuiApp:
         self._pil_image_tk = ImageTk
 
         self._build_ui()
+        self._load_ui_settings()
         self._bg_worker = threading.Thread(target=self._bg_worker_loop, daemon=True, name="ai-bg-worker")
         self._bg_worker.start()
         self._schedule_tick()
+
+    @property
+    def _follow_mode(self) -> str:
+        return self._runtime_state.follow_mode
+
+    @_follow_mode.setter
+    def _follow_mode(self, value: str) -> None:
+        self._runtime_state.follow_mode = value
+
+    @property
+    def _speed_mode(self) -> str:
+        return self._runtime_state.speed_mode
+
+    @_speed_mode.setter
+    def _speed_mode(self, value: str) -> None:
+        self._runtime_state.speed_mode = value
+
+    @property
+    def _selected_template_id(self) -> str | None:
+        return self._runtime_state.selected_template_id
+
+    @_selected_template_id.setter
+    def _selected_template_id(self, value: str | None) -> None:
+        self._runtime_state.selected_template_id = value
+
+    @property
+    def _reliable_detection_streak(self) -> int:
+        return self._runtime_state.reliable_detection_streak
+
+    @_reliable_detection_streak.setter
+    def _reliable_detection_streak(self, value: int) -> None:
+        self._runtime_state.reliable_detection_streak = value
+
+    @property
+    def _last_compose_feedback(self):
+        return self._runtime_state.last_compose_feedback
+
+    @_last_compose_feedback.setter
+    def _last_compose_feedback(self, value) -> None:
+        self._runtime_state.last_compose_feedback = value
+
+    @property
+    def _ready_since_ts(self) -> float:
+        return self._runtime_state.ready_since_ts
+
+    @_ready_since_ts.setter
+    def _ready_since_ts(self, value: float) -> None:
+        self._runtime_state.ready_since_ts = value
+
+    @property
+    def _latest_frame(self):
+        return self._runtime_state.latest_frame
+
+    @_latest_frame.setter
+    def _latest_frame(self, value) -> None:
+        self._runtime_state.latest_frame = value
+
+    @property
+    def _ai_angle_search_running(self) -> bool:
+        return self._runtime_state.ai_angle_search_running
+
+    @_ai_angle_search_running.setter
+    def _ai_angle_search_running(self, value: bool) -> None:
+        self._runtime_state.ai_angle_search_running = value
+
+    @property
+    def _ai_lock_mode_enabled(self) -> bool:
+        return self._runtime_state.ai_lock_mode_enabled
+
+    @_ai_lock_mode_enabled.setter
+    def _ai_lock_mode_enabled(self, value: bool) -> None:
+        self._runtime_state.ai_lock_mode_enabled = value
+
+    @property
+    def _ai_lock_target_box_norm(self) -> tuple[float, float, float, float] | None:
+        return self._runtime_state.ai_lock_target_box_norm
+
+    @_ai_lock_target_box_norm.setter
+    def _ai_lock_target_box_norm(self, value: tuple[float, float, float, float] | None) -> None:
+        self._runtime_state.ai_lock_target_box_norm = value
+
+    @property
+    def _ai_lock_fit_score(self) -> float:
+        return self._runtime_state.ai_lock_fit_score
+
+    @_ai_lock_fit_score.setter
+    def _ai_lock_fit_score(self, value: float) -> None:
+        self._runtime_state.ai_lock_fit_score = value
 
     def _build_ui(self) -> None:
         self._root.grid_columnconfigure(0, weight=4)
@@ -298,6 +436,9 @@ class GuiApp:
             onvalue=True,
             offvalue=False,
         ).grid(row=12, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(util_box, text="保存选项", command=self._save_ui_settings_manual).grid(
+            row=13, column=0, sticky="ew", pady=(6, 0)
+        )
 
         tune_box = ttk.LabelFrame(control_panel, text="跟随调参", padding=8)
         tune_box.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -338,7 +479,8 @@ class GuiApp:
         self._add_labeled_scale(tune_box, row=22, text="扫描Tilt步长(°)", variable=self._ai_scan_tilt_step, from_=1.0, to=6.0, formatter=lambda value: f"{value:.1f}")
         self._add_labeled_scale(tune_box, row=24, text="扫描候选数量", variable=self._ai_scan_max_candidates, from_=2, to=9, formatter=lambda value: f"{int(round(value))}")
         self._add_labeled_scale(tune_box, row=26, text="扫描候选等待(秒)", variable=self._ai_scan_settle_s, from_=0.5, to=3.0, formatter=lambda value: f"{value:.2f}")
-        self._add_labeled_scale(tune_box, row=28, text="背景抓取延时(秒)", variable=self._bg_capture_delay_s, from_=0.0, to=3.0, formatter=lambda value: f"{value:.2f}")
+        self._add_labeled_scale(tune_box, row=28, text="AI找角度倒计时(秒)", variable=self._ai_angle_countdown_s, from_=0, to=10, formatter=lambda value: f"{int(round(value))}")
+        self._add_labeled_scale(tune_box, row=30, text="背景抓取延时(秒)", variable=self._bg_capture_delay_s, from_=0.0, to=3.0, formatter=lambda value: f"{value:.2f}")
 
 
         template_box = ttk.LabelFrame(control_panel, text="模板库", padding=8)
@@ -530,12 +672,14 @@ class GuiApp:
                 self._detect_rate.mark(now)
 
             _, vision = self._async_detector.latest()
+            self._runtime_state.latest_vision = vision
             detector_error = self._async_detector.last_error
             if detector_error is not None and now - self._last_detector_error_ts > 2.0:
                 self._append_log(f"检测线程异常: {detector_error}")
                 self._last_detector_error_ts = now
             detection = self._target_selector.select(vision, self._follow_mode)
             stable = reliable_detection(detection, frame.shape)
+            self._runtime_state.stable_detection = stable
             self._reliable_detection_streak = 0 if stable is None else self._reliable_detection_streak + 1
             self._gesture_state.set_sensitivity(
                 stable_frames=int(self._gesture_stable_frames_var.get()),
@@ -547,7 +691,7 @@ class GuiApp:
             compose_target_override = None
             ready_for_gesture = False
             allow_open_fist_capture = False
-            selected_template = self._template_library.get(self._selected_template_id or "")
+            selected_template = self._template_service.get_selected_template()
             if (
                 self._mode_manager.mode == ControlMode.SMART_COMPOSE
                 and stable is not None
@@ -576,7 +720,7 @@ class GuiApp:
                     allow_open_fist_capture = ready_for_gesture
                 else:
                     self._ready_since_ts = 0.0
-                    self._gesture_state.reset()
+                    self._gesture_state.reset_pose_capture()
             elif self._mode_manager.mode == ControlMode.SMART_COMPOSE and selected_template is None:
                 # Allow gesture capture even when no template is selected.
                 self._last_compose_feedback = None
@@ -613,9 +757,9 @@ class GuiApp:
                         self._gimbal.move_relative(command.pan_delta, command.tilt_delta, smooth=True)
                         self._tracking_hold_until = now + self._tracking.settle_after_move_s
 
-            if self._ai_lock_mode_enabled and self._ai_lock_target_box_norm is not None and stable is not None:
-                self._ai_lock_fit_score = self._compute_lock_fit_score(stable.bbox, frame.shape)
-            else:
+            if self._ai_orchestrator.background_lock_enabled and stable is not None:
+                self._ai_orchestrator.update_lock_fit_score(stable.bbox, frame.shape)
+            elif self._ai_orchestrator.background_lock_enabled:
                 self._ai_lock_fit_score = 0.0
 
             if not bool(self._gesture_capture_enabled.get()):
@@ -699,7 +843,7 @@ class GuiApp:
                         template_layer,
                         compose_feedback,
                         selected_template,
-                        mirror_view=self._is_mirror_view_enabled(),
+                        mirror_view=False,
                     )
                     frame = self._blend_layer(frame, template_layer, float(self._template_overlay_alpha.get()))
                 if bool(self._show_ai_lock_box.get()) and self._ai_lock_target_box_norm is not None:
@@ -754,17 +898,12 @@ class GuiApp:
             self._append_log("已手动抓拍")
             return
         try:
-            process_command(
+            self._control_service.execute_command(
                 command,
-                mode_manager=self._mode_manager,
-                tracking=self._tracking,
-                gimbal=self._gimbal,
-                capture_trigger=self._capture_trigger,
-                manual_step_deg=self._manual_step_deg,
-                stop_event=self._stop_event,
                 notify=self._append_log,
                 set_follow_mode=self._set_follow_mode,
                 set_speed_mode=self._set_speed_mode,
+                stop_event=self._stop_event,
             )
         except Exception as exc:
             self._append_log(f"命令执行失败: {exc}")
@@ -830,29 +969,25 @@ class GuiApp:
         log_on_success: bool,
         suffix: str = "",
     ) -> None:
-        self._capture_trigger.trigger_capture(frame=frame, metadata=metadata, suffix=suffix)
-        if not bool(self._capture_auto_analyze_enabled.get()):
-            return
-        latest_capture_path = None
-        if isinstance(self._capture_trigger, LocalFileCaptureTrigger):
-            latest_capture_path = self._capture_trigger.latest_capture_path()
-        if not latest_capture_path:
-            return
-        if log_on_success:
-            self._append_log(f"已保存抓拍: {latest_capture_path}")
-        self._append_chat(f"AI: 正在分析抓拍 {os.path.basename(latest_capture_path)} ...")
-        self._run_in_bg(
-            lambda: self._ai_assistant.analyze_capture(
-                latest_capture_path,
-                context=self._build_ai_context(),
-            ),
-            on_success=lambda analysis: self._append_chat(
-                "AI抓拍分析: "
-                f"评分={analysis.score:.1f} | {analysis.summary} | 建议: "
-                f"{'；'.join(analysis.suggestions[:3]) if analysis.suggestions else '暂无建议'}"
-            ),
-            on_error=lambda exc: self._append_chat(f"AI: 抓拍分析失败: {exc}"),
+        result = self._capture_service.capture(
+            frame=frame,
+            metadata=metadata,
+            suffix=suffix,
+            auto_analyze=bool(self._capture_auto_analyze_enabled.get()),
+            context=self._build_ai_context(),
         )
+
+        if result.path and log_on_success:
+            self._append_log(f"已保存抓拍: {result.path}")
+
+        if result.analysis is not None:
+            self._append_chat(
+                "AI抓拍分析: "
+                f"评分={result.analysis.score:.1f} | {result.analysis.summary} | 建议: "
+                f"{'；'.join(result.analysis.suggestions[:3]) if result.analysis.suggestions else '暂无建议'}"
+            )
+        elif result.analysis_error:
+            self._append_log(f"抓拍后自动AI分析失败: {result.analysis_error}")
 
     def _upload_and_score_photo(self) -> None:
         path = self._pick_image_file("上传照片进行AI评分")
@@ -905,111 +1040,34 @@ class GuiApp:
             self._append_chat(f"AI: 请暂时离开画面，{delay_s:.1f}秒后开始扫描背景")
         else:
             self._append_chat("AI: 正在扫描现场背景并生成锁机位方案...")
+
+        def run_scan():
+            return self._ai_orchestrator.start_background_scan_and_lock(
+                scan_config, delay_s, self._latest_frame
+            )
+
+        def on_success(data):
+            from interfaces.ai_assistant import BatchBackgroundPickResult
+            result: BatchBackgroundPickResult = data["result"]
+            self._append_chat(
+                "AI锁机位已启用: "
+                f"评分={result.score:.1f} | "
+                f"{result.summary} | "
+                f"站位={result.placement} | "
+                f"机位={result.camera_angle} | "
+                f"光线={result.lighting} | "
+                f"扫描了{data['num_scanned']}个角度"
+            )
+            self._append_log("机位已锁定，自动转到最佳背景角度，请按框内站位拍摄")
+
         self._run_in_bg(
-            lambda: self._run_batch_background_scan(scan_config, delay_s),
-            on_success=self._apply_batch_background_lock,
+            run_scan,
+            on_success=on_success,
             on_error=lambda exc: self._append_chat(f"AI: 锁机位分析失败: {exc}"),
         )
 
-    def _run_batch_background_scan(
-        self, scan_config: dict[str, Any], delay_s: float,
-    ) -> dict[str, Any]:
-        """Batch scan background angles, upload all to AI, return best result."""
-        if delay_s > 0.05:
-            time.sleep(delay_s)
-
-        start_pan, start_tilt = self._gimbal.get_current_angles(prefer_feedback=True)
-        scan_offsets = self._build_scan_offsets(scan_config)
-        settle_s = max(0.5, float(scan_config.get("settle_s", 1.0)))
-
-        # Phase 1: Capture all candidate background frames
-        candidates: list[dict[str, Any]] = []
-        tmp_paths: list[str] = []
-        try:
-            for i, (dpan, dtilt) in enumerate(scan_offsets, start=1):
-                pan = start_pan + dpan
-                tilt = start_tilt + dtilt
-                self._gimbal.set_absolute(pan, tilt, smooth=True)
-                time.sleep(settle_s)
-                frame = self._latest_frame.copy() if self._latest_frame is not None else None
-                if frame is None:
-                    continue
-                with tempfile.NamedTemporaryFile(prefix="bg_scan_", suffix=".jpg", delete=False) as tmp:
-                    tmp_path = tmp.name
-                ok = cv2.imwrite(tmp_path, frame)
-                if not ok:
-                    continue
-                tmp_paths.append(tmp_path)
-                candidates.append({"pan": pan, "tilt": tilt, "path": tmp_path, "frame": frame})
-                self._root.after(
-                    0,
-                    lambda idx=i, total=len(scan_offsets): self._append_log(
-                        f"背景扫描 {idx}/{total}"
-                    ),
-                )
-
-            if not candidates:
-                self._gimbal.set_absolute(start_pan, start_tilt, smooth=True)
-                raise RuntimeError("无有效候选背景")
-
-            # Phase 2: Upload all to AI in one request
-            self._root.after(0, lambda: self._append_log(
-                f"正在上传{len(candidates)}张候选背景给AI分析..."
-            ))
-            result = self._ai_assistant.pick_best_background_from_batch(
-                [c["path"] for c in candidates]
-            )
-            best = candidates[result.best_index]
-
-            # Move to best position
-            self._gimbal.set_absolute(best["pan"], best["tilt"], smooth=True)
-            time.sleep(settle_s)
-
-            return {
-                "result": result,
-                "best_pan": best["pan"],
-                "best_tilt": best["tilt"],
-                "num_scanned": len(candidates),
-            }
-        finally:
-            for p in tmp_paths:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
-    def _apply_batch_background_lock(self, data: dict[str, Any]) -> None:
-        from interfaces.ai_assistant import BatchBackgroundPickResult
-        result: BatchBackgroundPickResult = data["result"]
-        max_delta = float(self._ai_lock_max_delta.get())
-        pan_delta = max(-max_delta, min(max_delta, result.recommended_pan_delta))
-        tilt_delta = max(-max_delta, min(max_delta, result.recommended_tilt_delta))
-        curr_pan, curr_tilt = self._gimbal.get_current_angles(prefer_feedback=True)
-        self._gimbal.set_absolute(curr_pan + pan_delta, curr_tilt + tilt_delta, smooth=True)
-        box = result.target_box_norm
-        if isinstance(box, tuple) and len(box) == 4:
-            self._ai_lock_target_box_norm = (
-                float(box[0]), float(box[1]), float(box[2]), float(box[3]),
-            )
-        else:
-            self._ai_lock_target_box_norm = (0.38, 0.18, 0.24, 0.66)
-        self._ai_lock_mode_enabled = True
-        self._ai_lock_fit_score = 0.0
-        self._append_chat(
-            "AI锁机位已启用: "
-            f"评分={result.score:.1f} | "
-            f"{result.summary} | "
-            f"站位={result.placement} | "
-            f"机位={result.camera_angle} | "
-            f"光线={result.lighting} | "
-            f"扫描了{data['num_scanned']}个角度"
-        )
-        self._append_log("机位已锁定，自动转到最佳背景角度，请按框内站位拍摄")
-
     def _unlock_ai_lock_mode(self) -> None:
-        self._ai_lock_mode_enabled = False
-        self._ai_lock_target_box_norm = None
-        self._ai_lock_fit_score = 0.0
+        self._ai_orchestrator.unlock_background_lock()
         self._append_log("已解除AI机位锁定")
         self._append_chat("AI: 已解除机位锁定，恢复常规模式")
 
@@ -1041,13 +1099,13 @@ class GuiApp:
         )
 
     def _start_ai_angle_search(self) -> None:
-        if self._ai_angle_search_running:
+        if self._ai_orchestrator.angle_search_running:
             self._append_log("AI自动找角度正在执行中，请稍候")
             return
         if self._latest_frame is None:
             self._append_log("AI自动找角度失败: 当前没有可用画面")
             return
-        self._ai_angle_search_running = True
+
         scan_config = {
             "pan_range": float(self._ai_scan_pan_range.get()),
             "tilt_range": float(self._ai_scan_tilt_range.get()),
@@ -1056,110 +1114,46 @@ class GuiApp:
             "max_candidates": int(self._ai_scan_max_candidates.get()),
             "settle_s": float(self._ai_scan_settle_s.get()),
         }
-        self._append_log("开始AI自动找角度，将拍摄全部候选后一次性提交AI分析")
-        self._append_chat("AI: 开始自动找角度，请保持姿势和位置尽量不动")
-        self._run_in_bg(
-            lambda: self._run_batch_angle_search(scan_config),
-            on_success=lambda result: self._finish_ai_angle_search(result, None),
-            on_error=lambda exc: self._finish_ai_angle_search(None, exc),
-        )
+        countdown_s = max(0, min(10, int(self._ai_angle_countdown_s.get())))
 
-    def _finish_ai_angle_search(self, result: dict[str, Any] | None, error: Exception | None) -> None:
-        self._ai_angle_search_running = False
-        if error is not None:
-            self._append_chat(f"AI: 自动找角度失败: {error}")
-            self._append_log(f"AI自动找角度失败: {error}")
-            return
-        if not result:
-            self._append_chat("AI: 自动找角度结束，但没有拿到有效结果")
-            return
-        self._append_chat(
-            "AI自动找角度结果: "
-            f"最佳评分={result.get('best_score', 0.0):.1f} | "
-            f"{result.get('summary', '')} | "
-            f"角度=pan {result.get('best_pan', 0.0):.1f}, tilt {result.get('best_tilt', 0.0):.1f} | "
-            f"候选数={result.get('num_scanned', 0)} | "
-            f"已保存最佳照片"
-        )
+        if countdown_s > 0:
+            self._append_log(f"AI自动找角度倒计时: {countdown_s}秒后开始")
+            self._append_chat(f"AI: {countdown_s}秒后开始自动找角度，请保持姿势和位置尽量不动")
+        else:
+            self._append_log("开始AI自动找角度，将拍摄全部候选后一次性提交AI分析")
+            self._append_chat("AI: 开始自动找角度，请保持姿势和位置尽量不动")
 
-    def _run_batch_angle_search(
-        self, scan_config: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Batch capture all candidates, upload to AI for best pick, save best."""
-        start_pan, start_tilt = self._gimbal.get_current_angles(prefer_feedback=True)
-        scan_offsets = self._build_scan_offsets(scan_config)
-        settle_s = max(0.5, float(scan_config.get("settle_s", 1.0)))
+        def run_search():
+            if countdown_s > 0:
+                self._run_bg_countdown(countdown_s, "AI自动找角度倒计时")
+                self._safe_ui_call(lambda: self._append_log("开始AI自动找角度，将拍摄全部候选后一次性提交AI分析"))
+                self._safe_ui_call(lambda: self._append_chat("AI: 开始自动找角度，请保持姿势和位置尽量不动"))
+            return self._ai_orchestrator.start_angle_search(scan_config, self._latest_frame)
 
-        # Phase 1: Capture all candidate frames
-        candidates: list[dict[str, Any]] = []
-        tmp_paths: list[str] = []
-        try:
-            for i, (dpan, dtilt) in enumerate(scan_offsets, start=1):
-                pan = start_pan + dpan
-                tilt = start_tilt + dtilt
-                self._gimbal.set_absolute(pan, tilt, smooth=True)
-                time.sleep(settle_s)
-                frame = self._latest_frame.copy() if self._latest_frame is not None else None
-                if frame is None:
-                    continue
-                with tempfile.NamedTemporaryFile(prefix="ai_scan_", suffix=".jpg", delete=False) as tmp:
-                    tmp_path = tmp.name
-                ok = cv2.imwrite(tmp_path, frame)
-                if not ok:
-                    continue
-                tmp_paths.append(tmp_path)
-                candidates.append({"pan": pan, "tilt": tilt, "path": tmp_path, "frame": frame})
-                self._root.after(
-                    0,
-                    lambda idx=i, total=len(scan_offsets): self._append_log(
-                        f"AI角度拍摄 {idx}/{total}"
-                    ),
-                )
-
-            if not candidates:
-                self._gimbal.set_absolute(start_pan, start_tilt, smooth=True)
-                raise RuntimeError("无有效候选角度")
-
-            # Phase 2: Upload all to AI in one request
-            self._root.after(0, lambda: self._append_log(
-                f"正在上传{len(candidates)}张候选照片给AI分析..."
-            ))
-            pick_result = self._ai_assistant.pick_best_from_batch(
-                [c["path"] for c in candidates]
+        def on_success(result):
+            self._append_chat(
+                "AI自动找角度结果: "
+                f"最佳评分={result.get('best_score', 0.0):.1f} | "
+                f"{result.get('summary', '')} | "
+                f"角度=pan {result.get('best_pan', 0.0):.1f}, tilt {result.get('best_tilt', 0.0):.1f} | "
+                f"候选数={result.get('num_scanned', 0)} | "
+                f"已保存最佳照片"
             )
-            best = candidates[pick_result.best_index]
 
-            # Phase 3: Move to best angle and save the best photo
-            self._gimbal.set_absolute(best["pan"], best["tilt"], smooth=True)
-            time.sleep(settle_s)
+        def on_error(exc):
+            self._append_chat(f"AI: 自动找角度失败: {exc}")
+            self._append_log(f"AI自动找角度失败: {exc}")
 
-            # Save best photo with suffix
-            if isinstance(self._capture_trigger, LocalFileCaptureTrigger):
-                save_frame = self._capture_frame_for_save(best["frame"])
-                self._capture_trigger.trigger_capture(
-                    frame=save_frame,
-                    metadata={
-                        "source": "ai_angle_search_best",
-                        "score": pick_result.score,
-                        "pan": best["pan"],
-                        "tilt": best["tilt"],
-                    },
-                    suffix="AI分析最佳结果",
-                )
+        self._run_in_bg(run_search, on_success=on_success, on_error=on_error)
 
-            return {
-                "best_score": float(pick_result.score),
-                "summary": pick_result.summary,
-                "best_pan": float(best["pan"]),
-                "best_tilt": float(best["tilt"]),
-                "num_scanned": len(candidates),
-            }
-        finally:
-            for p in tmp_paths:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+    def _run_bg_countdown(self, total_seconds: int, label: str) -> None:
+        seconds = max(0, int(total_seconds))
+        for remaining in range(seconds, 0, -1):
+            if self._stop_event.is_set():
+                raise RuntimeError(f"{label}已取消")
+            self._safe_ui_call(lambda sec=remaining: self._append_log(f"{label}: {sec}"))
+            time.sleep(1.0)
+
     def _build_scan_offsets(self, scan_config: dict[str, Any]) -> list[tuple[float, float]]:
         pan_range = max(1.0, float(scan_config.get("pan_range", 6.0)))
         tilt_range = max(1.0, float(scan_config.get("tilt_range", 3.0)))
@@ -1264,32 +1258,32 @@ class GuiApp:
         self._log.configure(state="disabled")
 
     def _refresh_template_combo(self) -> None:
-        templates = self._template_library.list_templates()
+        templates = self._template_service.list_templates()
         if not templates:
             self._template_combo["values"] = ["未选择模板"]
             self._template_var.set("未选择模板")
-            self._selected_template_id = None
+            self._template_service.clear_selected_template()
             self._update_template_preview(None)
             return
         values = [f"{t.name} ({t.created_at})" for t in templates]
         self._template_combo["values"] = values
         if self._selected_template_id is None:
-            self._selected_template_id = templates[-1].template_id
+            self._template_service.select_template(templates[-1].template_id)
         selected_idx = next(
             (i for i, t in enumerate(templates) if t.template_id == self._selected_template_id),
             len(templates) - 1,
         )
         self._template_var.set(values[selected_idx])
-        self._selected_template_id = templates[selected_idx].template_id
+        self._template_service.select_template(templates[selected_idx].template_id)
         template = templates[selected_idx]
         self._update_template_preview(template.image_path)
 
     def _on_template_selected(self) -> None:
-        templates = self._template_library.list_templates()
+        templates = self._template_service.list_templates()
         current = self._template_var.get().strip()
         for t in templates:
             if current.startswith(f"{t.name} ("):
-                self._selected_template_id = t.template_id
+                self._template_service.select_template(t.template_id)
                 self._update_template_preview(t.image_path)
                 self._append_log(f"已选择模板: {t.name}")
                 return
@@ -1298,35 +1292,24 @@ class GuiApp:
         path = self._pick_image_file("选择模板照片")
         if not path:
             return
-        image = cv2.imread(path)
-        if image is None:
-            self._append_log("模板读取失败: 图片无法打开")
-            return
-        vision = self._detector.detect(image)
-        candidates = vision.tracking_candidates or []
-        detection = max(candidates, key=lambda d: d.bbox.area) if candidates else vision.tracking_detection
-        if detection is None:
-            self._append_log("模板创建失败: 未检测到人物")
-            return
-        name = os.path.splitext(os.path.basename(path))[0]
-        profile = self._template_engine.create_profile(name, path, detection, image.shape)
-        if profile is None:
-            self._append_log("模板创建失败: 未检测到有效人物区域，请更换照片后重试")
-            return
-        self._template_library.add(profile)
-        self._selected_template_id = profile.template_id
-        self._refresh_template_combo()
-        self._append_log(f"模板已添加: {profile.name}")
+
+        try:
+            profile = self._template_service.import_template(path)
+            self._template_service.select_template(profile.template_id)
+            self._refresh_template_combo()
+            self._append_log(f"模板已添加: {profile.name}")
+        except ValueError as exc:
+            self._append_log(str(exc))
 
     def _delete_template(self) -> None:
         if self._selected_template_id is None:
             return
-        template = self._template_library.get(self._selected_template_id)
-        self._template_library.remove(self._selected_template_id)
-        self._selected_template_id = None
-        self._refresh_template_combo()
-        if template is not None:
-            self._append_log(f"模板已删除: {template.name} (未删除原图)")
+
+        if self._template_service.delete_template(self._selected_template_id):
+            self._refresh_template_combo()
+            self._append_log("模板已删除 (未删除原图)")
+        else:
+            self._append_log("模板删除失败")
 
     def _update_template_preview(self, image_path: str | None) -> None:
         if image_path is None or not os.path.exists(image_path):
@@ -1592,7 +1575,129 @@ class GuiApp:
         self._tracking.set_speed_mode(mode)
         self._speed_var.set(speed_to_text(mode))
 
+    def _save_ui_settings_manual(self) -> None:
+        self._save_ui_settings(quiet=False)
+
+    def _save_ui_settings(self, *, quiet: bool) -> None:
+        payload = {
+            "version": 1,
+            "selected_template_id": self._selected_template_id,
+            "follow_mode": self._follow_mode,
+            "speed_mode": self._speed_mode,
+            "gesture_capture_enabled": bool(self._gesture_capture_enabled.get()),
+            "force_ok_enabled": bool(self._force_ok_enabled.get()),
+            "capture_auto_analyze_enabled": bool(self._capture_auto_analyze_enabled.get()),
+            "compose_auto_control": bool(self._compose_auto_control.get()),
+            "show_ai_lock_box": bool(self._show_ai_lock_box.get()),
+            "ai_lock_fit_threshold": float(self._ai_lock_fit_threshold.get()),
+            "ai_lock_max_delta": float(self._ai_lock_max_delta.get()),
+            "ai_scan_pan_range": float(self._ai_scan_pan_range.get()),
+            "ai_scan_tilt_range": float(self._ai_scan_tilt_range.get()),
+            "ai_scan_pan_step": float(self._ai_scan_pan_step.get()),
+            "ai_scan_tilt_step": float(self._ai_scan_tilt_step.get()),
+            "ai_scan_max_candidates": int(self._ai_scan_max_candidates.get()),
+            "ai_scan_settle_s": float(self._ai_scan_settle_s.get()),
+            "ai_angle_countdown_s": int(self._ai_angle_countdown_s.get()),
+            "bg_capture_delay_s": float(self._bg_capture_delay_s.get()),
+            "gesture_countdown_s": float(self._gesture_countdown_s.get()),
+            "gesture_stable_frames": int(self._gesture_stable_frames_var.get()),
+            "gesture_open_hold_s": float(self._gesture_open_hold_s_var.get()),
+            "compose_score_threshold": float(self._compose_score_threshold_var.get()),
+            "mirror_view": bool(self._mirror_view_var.get()),
+            "show_live_lines": bool(self._show_live_lines.get()),
+            "show_live_bbox": bool(self._show_live_bbox.get()),
+            "show_template_lines": bool(self._show_template_lines.get()),
+            "show_template_bbox": bool(self._show_template_bbox.get()),
+            "live_overlay_alpha": float(self._live_overlay_alpha.get()),
+            "template_overlay_alpha": float(self._template_overlay_alpha.get()),
+        }
+        try:
+            os.makedirs(os.path.dirname(self._ui_settings_path), exist_ok=True)
+            with open(self._ui_settings_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            if not quiet:
+                self._append_log(f"选项已保存: {self._ui_settings_path}")
+        except Exception as exc:
+            if not quiet:
+                self._append_log(f"保存选项失败: {exc}")
+
+    def _load_ui_settings(self) -> None:
+        if not os.path.exists(self._ui_settings_path):
+            return
+        try:
+            with open(self._ui_settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+        except Exception as exc:
+            self._append_log(f"读取选项失败，已忽略: {exc}")
+            return
+
+        bool_vars = {
+            "gesture_capture_enabled": self._gesture_capture_enabled,
+            "force_ok_enabled": self._force_ok_enabled,
+            "capture_auto_analyze_enabled": self._capture_auto_analyze_enabled,
+            "compose_auto_control": self._compose_auto_control,
+            "show_ai_lock_box": self._show_ai_lock_box,
+            "mirror_view": self._mirror_view_var,
+            "show_live_lines": self._show_live_lines,
+            "show_live_bbox": self._show_live_bbox,
+            "show_template_lines": self._show_template_lines,
+            "show_template_bbox": self._show_template_bbox,
+        }
+        for key, var in bool_vars.items():
+            if key in data:
+                var.set(bool(data[key]))
+
+        float_vars = {
+            "ai_lock_fit_threshold": self._ai_lock_fit_threshold,
+            "ai_lock_max_delta": self._ai_lock_max_delta,
+            "ai_scan_pan_range": self._ai_scan_pan_range,
+            "ai_scan_tilt_range": self._ai_scan_tilt_range,
+            "ai_scan_pan_step": self._ai_scan_pan_step,
+            "ai_scan_tilt_step": self._ai_scan_tilt_step,
+            "ai_scan_settle_s": self._ai_scan_settle_s,
+            "bg_capture_delay_s": self._bg_capture_delay_s,
+            "gesture_countdown_s": self._gesture_countdown_s,
+            "gesture_open_hold_s": self._gesture_open_hold_s_var,
+            "compose_score_threshold": self._compose_score_threshold_var,
+            "live_overlay_alpha": self._live_overlay_alpha,
+            "template_overlay_alpha": self._template_overlay_alpha,
+        }
+        for key, var in float_vars.items():
+            if key in data:
+                try:
+                    var.set(float(data[key]))
+                except Exception:
+                    pass
+
+        int_vars = {
+            "ai_scan_max_candidates": self._ai_scan_max_candidates,
+            "ai_angle_countdown_s": self._ai_angle_countdown_s,
+            "gesture_stable_frames": self._gesture_stable_frames_var,
+        }
+        for key, var in int_vars.items():
+            if key in data:
+                try:
+                    var.set(int(round(float(data[key]))))
+                except Exception:
+                    pass
+
+        follow_mode = data.get("follow_mode")
+        if isinstance(follow_mode, str) and follow_mode in FOLLOW_TEXT:
+            self._set_follow_mode(follow_mode)
+        speed_mode = data.get("speed_mode")
+        if isinstance(speed_mode, str) and speed_mode in SPEED_TEXT:
+            self._set_speed_mode(speed_mode)
+
+        selected_template_id = data.get("selected_template_id")
+        if isinstance(selected_template_id, str) and self._template_library.get(selected_template_id) is not None:
+            self._selected_template_id = selected_template_id
+        self._refresh_template_combo()
+        self._append_log(f"已加载上次选项: {self._ui_settings_path}")
+
     def _on_close(self) -> None:
+        self._save_ui_settings(quiet=True)
         self._stop_event.set()
         self._root.destroy()
 

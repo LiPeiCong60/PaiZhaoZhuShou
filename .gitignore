@@ -2,13 +2,32 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 .cache/
 captures/
 .template_library/
+*.db
+*.sqlite
+*.sqlite3
 
 .env
 .env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
 
 *.log
 *.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

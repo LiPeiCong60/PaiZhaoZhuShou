@@ -1,110 +1,376 @@
-# 智能云台拍照助手 — 项目技术架构文档
+# 智能云台拍照助手项目文档（2026-04）
 
-## 1. 项目概览
+## 1. 文档目的
 
-本项目是基于 Python 的全 GUI 化智能云台拍摄辅助系统，通过视觉反馈实现以下核心能力的跨平台结合：
+这份文档描述的是当前根目录版本的真实实现，而不是早期的纯规划状态。
 
-- **深度实时视频识别**：接入外置 USB 摄像头或手机 IP 实时视频流串接，使用融合了 MediaPipe 和 YOLO 的追踪系统探测人物与姿态。
-- **动态云台闭环跟随**：实时指令集输出到串口（硬件级）或模拟器，实现追踪锁定、防抖云台联动。
-- **模板指导评分构架**：保存姿态和画幅构图锚点比例，支持相似骨架识别。
-- **系统高集成手势触发**：张合手、强制 OK 手势拍照，提供极佳单体互动倒计时抓拍体验。
-- **SiliconFlow API 大模型赋能**：实现深度场景环境结合分析：
-  - **基于 AI 的一次批量化选优（角度搜寻与背景机位判定）**
-  - **基于 "Detail: Low" 和定制 `max_tokens` 强约束条件的安全防错云端交互，具备完整网络容灾能力**
-- **全要素落盘与后缀标记系统**：记录所有重要关键数据，生成完整摄影资料集。
+本轮工作的目标不是重写项目，而是把上一轮未完成的 service/API 拆分真正接回现有核心链路，达到下面两点：
 
-## 2. 工程目录结构说明
+- GUI 主入口 `main.py` 继续可用
+- FastAPI 接口可以拿到真实会话、真实状态和真实服务能力
 
-```
-├── main.py                  # Tkinter UI 主程序编排：视频源轮询、UI构建与事件钩子、云台与 AI 批量命令分发
-├── app_core.py              # 共享引擎核心：动作解析过滤置信度算法和目标多路优选算法
-├── config.py                # System / Runtime 基础配置参数载体
-├── detector.py              # 高鲁棒性双驱探测器：MediaPipe(追踪基础+精确定位) & YOLO(大面积追踪补充)
-├── template_compose.py      # ComposeFeedback反馈和 Template 相似性打分引擎、拍照动态手势状态机
-├── tracking_controller.py   # Tracker 控制环：利用缓冲指数平滑算法 (EMA) 转化偏移距至舵机转动限值内
-├── gimbal_controller.py     # 驱动代理工厂：提供 TTL 总线/PCA9685/Mock 三端云台硬件解耦驱动
-├── video_source.py          # 基于 OpenCV 的双端缓存视频采集模块及断流自动重启
-├── mode_manager.py          # 控制模式枚举系统 (Manual, Auto_Track, Smart_Compose)
-├── ui/
-│   └── cn_text.py           # 中英多国语字符 PIL-cv2 混构内存池模块
-├── utils/
-│   ├── common_types.py      # Point/BBox/Detection 复合基础声明，严格强校验
-│   ├── overlay_renderer.py  # GUI视觉框体与透明多图层融合渲染工厂
-│   └── ui_text.py           # 固定键值对状态中文反解
-├── interfaces/
-│   ├── ai_assistant.py      # 【大模型大脑层】SiliconFlowAIPhotoAssistant 具体实施：批量发送候选图片列至服务器分析及强校验JSON转换
-│   ├── capture_trigger.py   # 【磁盘写入代理】处理保存与自动附加智能拍照说明后缀（如 _AI分析最佳结果）
-│   └── target_strategy.py   # Follow anchor 位置偏移点提取
-├── docs/                    # 【项目技术文档说明目录】
-├── captures/                # 【落盘结果输出集合】：系统强制按日（YYYY-MM-DD）分配文件夹
-└── .template_library/       # 模板库元数据结构
-```
+## 2. 当前版本说明
 
-## 3. 工作流与通讯架构
+- 根目录代码树仍然是主版本，后续联调和维护以根目录源码为准
+- `main.py` 仍然是 GUI 主入口
+- `api/app.py` 是 FastAPI 主入口
+- 视觉检测、模板评估、云台控制、AI 协议仍沿用现有项目实现，没有更换算法或替换协议
+- 这轮新增的 service/repository/api 结构，是对现有核心类的封装和联调修复，不是独立重写的一套新系统
 
-```mermaid
-graph TD
-    A[OpenCV_Worker] -->|拉取源画面| B[AsyncDetector (多模型处理层)]
-    B -->|合并与容差| C[TargetSelector]
-    C -->|分析定位框| D{工作模式层管理器}
-    D -->|模式: Auto| E[Tracking Controller \n 偏移计算与防抖动]
-    D -->|模式: Compose| F[Compose Engine \n 手势状态评估与动作反馈]
-    D -->|模式: AI扫描搜索| G[云台主动搜集图像列表]
-    
-    G -->|全量候选数组| H[SiliconFlow Batch Analyst \n 联合多背景/角度挑选]
-    
-    E -->|度数增量| I[Gimbal 驱动代理]
-    H -->|JSON结果| J[Gimbal锁定位与抓拍执行]
-    F -->|事件激活| K[Capture Trigger \n 追加后缀处理]
-    
-    K -.->|图片绝对路径| L[SiliconFlow 评分层异步队列]
-    L ==>|UI更新与排版| M[Tkinter 主系统]
+## 3. 当前关键目录
+
+```text
+DaDuoJi/
+├─ main.py
+├─ tracking_controller.py
+├─ gimbal_controller.py
+├─ template_compose.py
+├─ services/
+│  ├─ runtime_state.py
+│  ├─ control_service.py
+│  ├─ capture_service.py
+│  ├─ template_service.py
+│  ├─ ai_orchestrator.py
+│  └─ status_service.py
+├─ repositories/
+│  ├─ template_repository.py
+│  └─ local_template_repository.py
+├─ api/
+│  ├─ app.py
+│  ├─ dependencies.py
+│  ├─ session_manager.py
+│  └─ routes/
+│     ├─ session.py
+│     ├─ control.py
+│     ├─ capture.py
+│     ├─ template.py
+│     ├─ ai.py
+│     └─ status.py
+├─ docs/
+│  ├─ PROJECT_DOCUMENTATION.md
+│  ├─ REFACTOR_TASKS.md
+│  ├─ INTEGRATION_API_PLAN.md
+│  ├─ API_QUICKSTART.md
+│  └─ SMOKE_CHECKLIST.md
+└─ .template_library/
 ```
 
-### 多线程安全通信
+## 4. 当前运行时架构
 
-本项目彻底放弃繁杂 CLI 环境和死锁隐患。通过建立规范队列以响应交互性能请求：
+当前系统已经形成两条入口、同一套核心能力的结构：
 
-| 数据流 | 线程机制 |
-|--------|----------|
-| Tkinter 主界面更新循环 | 单一主线程安全托管，`self._root.after()` 防碰撞。所有检测更新与图像拼装限频执行。 |
-| OpenCV视频流采集 | 后台 `_reader_worker` 无锁缓存共享循环。 |
-| 高计算双探测器(Yolo/Mp) | 内聚化 Threading 子队列处理识别，输出 Result 打包引用，并抛弃失效帧防积压。 |
-| AI API 调用及延迟阻塞 | `.run_in_bg` 构建专门守护线程发送 request 并捕获任意异常网络，最终以 callback 安全反写回 UI Log。 |
+- GUI 入口：`main.py`
+- API 入口：`api/app.py`
 
-## 4. 重点设计说明
+两条入口都复用根目录现有核心类：
 
-### 4.1. SiliconFlow AI 分析接口体系优化 (`ai_assistant.py`)
-系统利用 `interfaces/ai_assistant.py` 完全接管所有对外通信。最新设计包含了：
-1. **防止幻觉与请求污染**：将每次 HTTP Request 物件和 Exception Object 进行循环隔离。
-2. **极速推理（Token和网络开销极速优化）**：固定 Payload 中加入 `"detail": "low"` 及 `"max_tokens": 250~400`。
-3. **强大的并行批处理 API (`pick_best_from_batch` 和 `pick_best_background_from_batch`)**：
-   - 使用包含多图片的组合式 Prompt，实现 9张图片甚至更多组合一次性上传 AI 服务器进行并行计算选取。
-4. **稳定数据清洗反解**：定制化了强大的 `_extract_json_obj` 以应对模型带有废话的情况，强制反构 `BatchPickResult` 等对象类型返回。
+- 视频源：`OpenCVVideoSource`
+- 识别器：`MediaPipeYoloVisionDetector` + `AsyncDetector`
+- 跟随控制：`TrackingController`
+- 云台控制：`GimbalController`
+- 模板构图：`TemplateComposeEngine`
+- AI 接口：`build_ai_assistant_from_env()`
 
-### 4.2. 云台自动操作锁控机制 (`main.py` Batch Logic)
-由于手动操作费时费力，引入以下完整主动行为控制逻辑：
-- `_run_batch_angle_search`: 在执行后主动接管云台，利用设置好的平摇步长，等待步进时间稳定后存储每个镜头的候选集。随后统一打包，通过调用 API 分析完成后，云台**回退定位到该最佳候选集方位**，最后调用封装了“照片说明后缀”的抓拍进行结果落地。
-- `_run_batch_background_scan`: 用于执行最佳背景锁定机位。此过程包含倒计时规避摄影师机制（让系统记录全量纯净背景帧）并完成锁定供模特配合。
+在这些核心类之上，这轮新增了一层 service 封装和共享状态：
 
-### 4.3. 多驱动的设备支持 (`gimbal_controller.py`)
-- 高级隔离硬件： `ServoDriver` 抽象类保证了不限于总线舵机 TTL (`TTLBusSerialDriver`) 或者板卡 PWM (`RaspberryPiPWMDriver`) 可以随时注入主 Controller，且附带完全隔离的 `MockServoDriver` 方便进行系统算法独立测试。
+- `RuntimeState` 负责统一运行时状态
+- `ControlService` 负责模式、跟随模式、速度模式、手动控制、回中
+- `CaptureService` 负责抓拍和抓拍后的 AI 分析返回
+- `TemplateService` 负责模板导入、查询、选择、删除
+- `AIOrchestrator` 负责自动找角度和背景扫描锁机位
+- `StatusService` 负责聚合对外状态
 
-### 4.4 模板系统算法 (`template_compose.py`)
-评分完全定制化：
-- **姿态与关节吻合占 70%** (采用角度差分运算)。
-- **位置长宽比例构画占 30%**。
-- 支持倒计时容错机制和强制取消机制（张开手保持时间过短自动剔除等安全验证）。
+这意味着 GUI 和 API 不再各自维护一套独立逻辑，而是共享同一套状态契约和 service 能力。
 
-## 5. 项目核心配置说明
+## 5. 单一状态源：`services/runtime_state.py`
 
-| UI 参数滑轨或项 | 对应底层结构 | 技术提示与性能阈值 |
-|-----------------|--------------|--------------------|
-| 扫描候选数量 | `max_candidates` (2~9) | 多于10会导致 Token 剧烈膨胀及 API 拒收；最佳设置为 5左右以权衡出图数量。 |
-| 显示覆盖叠加度 | `live_overlay_alpha` | CV2的 `addWeighted` 操作。在嵌入版上，过度复杂的渲染会轻微引发掉帧。 |
-| 手势验证保留期 / 缓冲帧 | `gesture_stable_frames` | 抑制探测器在握拳瞬间产生的帧丢失识别突跳，通过队列过滤实现。 |
-| `max_side`压缩比 | AI Payload Resize | `_encode_image_as_data_url` 函数最高限制 720px 高宽及 `quality=70` 大幅减少流量。 |
+`RuntimeState` 是当前 GUI、service、API 之间的单一状态源，主要字段如下：
 
-## 6. 后续维护预留
+- `follow_mode`
+- `speed_mode`
+- `selected_template_id`
+- `reliable_detection_streak`
+- `last_compose_feedback`
+- `ready_since_ts`
+- `latest_frame`
+- `latest_vision`
+- `stable_detection`
+- `latest_capture_path`
+- `latest_capture_analysis`
+- `latest_capture_error`
+- `ai_angle_search_running`
+- `ai_lock_mode_enabled`
+- `ai_lock_target_box_norm`
+- `ai_lock_fit_score`
 
-因目前的架构实现了底层 API 的无状态请求解耦。若未来 SiliconFlow 增加高阶函数调用 (Function Calling) 甚至视频端点直接交互分析，仅需要替换或增加在 `ai_assistant.py` 内部的 `_chat` 装载模块。若有需要扩展其它检测后端如 RT-DETR 等，仅需继承并重写 `detector.py`。
+本轮明确统一了以下原本容易分裂的状态来源：
+
+- 跟随模式 `follow_mode`
+- 速度模式 `speed_mode`
+- 当前模板 `selected_template_id`
+- AI 自动找角度运行状态
+- AI 锁机位状态
+- AI 锁机位 fit score
+
+GUI 侧通过 `main.py` 中的属性代理继续兼容旧字段访问；API 侧通过 `StatusService` 读取同一份状态；AI 侧通过 `AIOrchestrator` 写回同一份状态。
+
+## 6. Service 层真实契约
+
+### 6.1 `ControlService`
+
+`ControlService` 现在已经修正为基于项目真实类接口工作，不再调用不存在的成员。
+
+本轮修复点：
+
+- 不再依赖不存在的 `TrackingController.follow_mode`
+- 不再依赖不存在的 `TrackingController.speed_mode`
+- 不再依赖不存在的 `TrackingController.set_follow_mode()`
+- 不再依赖不存在的 `GimbalController.manual_move()`
+
+当前真实契约：
+
+- `follow_mode` 保存在 `RuntimeState`
+- `speed_mode` 保存在 `RuntimeState`，并通过 `TrackingController.set_speed_mode()` 同步到跟随控制器
+- `manual_move()` 通过 `GimbalController.move_relative()` 执行上下左右移动
+- `home()` 通过 `GimbalController.home()` 回中
+
+### 6.2 `CaptureService`
+
+`CaptureService` 现在不再吞掉抓拍后的关键结果。
+
+当前行为：
+
+- 调用 `CaptureTrigger` 完成真实抓拍
+- 如果启用 `auto_analyze=True`，会调用 `AIPhotoAssistant.analyze_capture()`
+- 返回 `CaptureResult(path, analysis, analysis_error)`
+- 同步更新 `RuntimeState.latest_capture_path`
+- 同步更新 `RuntimeState.latest_capture_analysis`
+- 同步更新 `RuntimeState.latest_capture_error`
+
+这保证了 GUI 和 API 都能拿到同一份抓拍结果，而不是只有落盘、没有分析结果回传。
+
+### 6.3 `TemplateService`
+
+`TemplateService` 已经不再直接依赖 `TemplateLibrary`，而是依赖 `TemplateRepository` 抽象接口。
+
+当前结构：
+
+- 仓储接口：`repositories/template_repository.py`
+- 本地实现：`repositories/local_template_repository.py`
+- GUI 和 API 当前都接的是 `LocalTemplateRepository`
+
+导入模板时的真实流程：
+
+1. 读取上传图像
+2. 调用检测器识别人像
+3. 生成 `TemplateProfile`
+4. 通过 `TemplateRepository.add()` 持久化模板元数据
+5. 把源图片复制到 `.template_library/images/`
+
+这样做的原因是 API 上传常用临时文件，如果不复制到模板目录，模板会指向已经删除的临时文件。
+
+### 6.4 `AIOrchestrator`
+
+`AIOrchestrator` 现在负责两条真实 AI 链路：
+
+- 自动找角度 `start_angle_search()`
+- 背景扫描锁机位 `start_background_lock()`
+
+本轮修复重点：
+
+- 不再只改内部私有状态，而是统一写回 `RuntimeState`
+- 不再拿一张旧帧假装完成整轮扫描，而是通过 `frame_provider` 在每个扫描点重新取当前画面
+- 背景锁机位的目标框、启用状态、fit score 都统一写入共享状态
+
+### 6.5 `StatusService`
+
+`StatusService` 现在是状态聚合出口，而不是各模块零散字段的临时拼装。
+
+当前对外聚合的核心字段包括：
+
+- 当前模式
+- `follow_mode`
+- `speed_mode`
+- 模板得分和 ready 状态
+- 当前模板 ID
+- 跟踪是否稳定
+- AI 自动找角度是否运行中
+- AI 锁机位是否启用
+- AI fit score
+- AI 目标框
+- 最近一次抓拍路径
+- 最近一次抓拍错误
+
+## 7. GUI 与 AI 联动修复点
+
+`main.py` 仍然保留 GUI 主入口，但现在已经接到共享状态和 service 层，而不是继续读写完全分裂的旧字段。
+
+当前已经完成的联动修复：
+
+- GUI 锁定框读取共享的 `ai_lock_target_box_norm`
+- GUI 状态栏读取共享的模式、模板和 AI 状态
+- 锁机位开启时，会正确抑制自动跟随
+- AI 搜索运行状态显示来自 `RuntimeState.ai_angle_search_running`
+- 模板选择、清空、删除走 `TemplateService`
+- 手动抓拍后，GUI 可以继续拿到 `CaptureResult` 中的分析结果
+
+需要注意：
+
+- GUI 这轮完成的是状态和 service 联通修复
+- 还没有做完整的人工交互回归，后续仍建议按 `docs/SMOKE_CHECKLIST.md` 做一轮手工验证
+
+## 8. API 会话模型
+
+API 当前采用单活会话模型，由 `api/session_manager.py` 管理。
+
+### 8.1 `open_session`
+
+`POST /api/v1/session/open` 会创建一份真实会话上下文 `ApiSessionContext`，其中包含：
+
+- `OpenCVVideoSource`
+- `MediaPipeYoloVisionDetector`
+- `AsyncDetector`
+- `TrackingController`
+- `ModeManager`
+- `LocalFileCaptureTrigger`
+- `AIPhotoAssistant`
+- `GimbalController`
+- `ControlService`
+- `CaptureService`
+- `TemplateService`
+- `AIOrchestrator`
+- `StatusService`
+
+API 会话不是“路由里临时 new 一次就丢掉”的一次性对象，后续所有接口都复用这份上下文。
+
+当前需要额外说明一点：
+
+- API 会话里当前默认使用的是 `MockServoDriver()`
+- 也就是说 API 已经接通了真实控制链路和状态链路，但默认不会直接驱动真硬件云台
+- 如果后续要让 API 直接控制真硬件，需要在 `ApiSessionContext` 上再补一层明确的硬件配置入口
+
+### 8.2 后台帧循环
+
+`ApiSessionContext` 内部有独立的帧循环，用于在不启动 GUI 的情况下维持实时状态：
+
+- 持续读取视频源
+- 提交检测任务
+- 读取最新视觉结果
+- 更新 `stable_detection`
+- 更新 `reliable_detection_streak`
+- 在模板模式下更新 `last_compose_feedback`
+- 在自动跟随允许时执行云台控制
+- 在锁机位模式下更新 `ai_lock_fit_score`
+
+这保证了 API 单独运行时也能看到真实实时状态，而不是只有 GUI 模式下才有效。
+
+### 8.3 `close_session`
+
+`POST /api/v1/session/close` 会：
+
+- 停止后台帧循环
+- 等待 AI 任务线程结束
+- 关闭 `AsyncDetector`
+- 关闭视频源
+- 关闭云台控制器
+
+## 9. API 路由结构
+
+当前 API 已统一为 `api/app.py + api/routes/*` 结构，所有需要路由都已经注册到 FastAPI。
+
+### 9.1 会话路由
+
+- `POST /api/v1/session/open`
+- `POST /api/v1/session/close`
+
+### 9.2 控制路由
+
+- `POST /api/v1/control/mode`
+- `POST /api/v1/control/manual-move`
+- `POST /api/v1/control/home`
+- `POST /api/v1/control/follow-mode`
+- `POST /api/v1/control/speed`
+
+### 9.3 抓拍路由
+
+- `POST /api/v1/capture/manual`
+
+### 9.4 模板路由
+
+- `POST /api/v1/templates/import`
+- `GET /api/v1/templates/`
+- `POST /api/v1/templates/select`
+- `DELETE /api/v1/templates/{template_id}`
+
+### 9.5 AI 路由
+
+- `POST /api/v1/ai/angle-search/start`
+- `POST /api/v1/ai/background-lock/start`
+- `POST /api/v1/ai/background-lock/unlock`
+
+### 9.6 状态路由
+
+- `GET /api/v1/status`
+- `GET /api/v1/status/mode`
+- `GET /api/v1/status/compose`
+- `GET /api/v1/status/tracking`
+- `GET /api/v1/status/ai`
+
+## 10. 启动方式
+
+### 10.1 启动 GUI
+
+```powershell
+python main.py --stream-url 0 --mock-gimbal
+```
+
+### 10.2 启动 API
+
+```powershell
+python -m uvicorn api.app:app --host 0.0.0.0 --port 8000
+```
+
+依赖至少需要包含：
+
+- `fastapi`
+- `uvicorn`
+- `python-multipart`
+
+## 11. 已完成的最小验证
+
+本轮已完成的最小验证包括：
+
+- `python -m compileall main.py services api repositories`
+- GUI 能启动且不会立即崩溃
+- API 能启动并返回健康检查
+- `GET /api/v1/status` 可用
+- 模板导入、列表、选择、删除可用
+- 手动抓拍接口可用
+- AI 自动找角度接口能真实启动流程并产出结果
+- AI 背景锁机位接口能真实启动流程并写回状态
+
+本轮最小验证使用的是开发环境常见条件：
+
+- 视频源可使用静态样例图或测试流
+- API 会话默认使用 mock 云台驱动
+- 若未配置 `SILICONFLOW_API_KEY`，AI 流程会走 Mock AI，但扫描、抓拍、状态写回链路仍是真实执行
+
+## 12. 当前仍未闭环的事项
+
+当前文档、代码和最小联调链路已经对齐，但下面几项仍建议后续继续补齐：
+
+- GUI 的完整人工回归还没做完
+- 真实直播流环境还没做一轮长时间验证
+- 真实 SiliconFlow Key 环境还没做一轮完整实测
+- 自动化测试仍为空，当前验证仍以 compileall 和 smoke 为主
+
+## 13. 相关文档
+
+- `docs/API_QUICKSTART.md`
+  面向联调方的接口快速上手说明
+- `docs/INTEGRATION_API_PLAN.md`
+  面向联调改造的结构说明
+- `docs/SMOKE_CHECKLIST.md`
+  当前建议执行的最小冒烟检查项
+- `docs/REFACTOR_TASKS.md`
+  本轮“上一轮不完整联调重构修复”任务状态
