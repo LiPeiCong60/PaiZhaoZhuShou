@@ -135,6 +135,7 @@ graph TD
 
 #### AI
 
+- `POST /api/v1/ai/analyze-upload`
 - `POST /api/v1/ai/angle-search/start`
 - `POST /api/v1/ai/background-lock/start`
 - `POST /api/v1/ai/background-lock/unlock`

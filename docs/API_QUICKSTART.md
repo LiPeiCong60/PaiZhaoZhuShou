@@ -396,6 +396,41 @@ curl -X POST "http://localhost:8000/api/v1/capture/manual?auto_analyze=true"
 
 ### 5.7 AI 接口
 
+#### `POST /api/v1/ai/analyze-upload`
+
+作用：
+- 上传单张照片并立即执行 AI 分析
+- `analysis_type=photo` 时返回单图评分与建议
+- `analysis_type=background` 时返回背景分析与推荐机位
+- 该接口不强依赖会话；如果当前已有会话，会自动带上当前模式和模板上下文
+
+请求：
+- `multipart/form-data`
+- 文件字段名：`file`
+- 可选 query 参数：`analysis_type=photo|background`，默认 `photo`
+
+示例：
+```bash
+curl -X POST "http://localhost:8000/api/v1/ai/analyze-upload?analysis_type=photo" ^
+  -H "Content-Type: multipart/form-data" ^
+  -F "file=@C:/path/to/photo.jpg"
+```
+
+返回示例：
+```json
+{
+  "message": "上传图片分析完成",
+  "filename": "photo.jpg",
+  "analysis_type": "photo",
+  "used_session_context": false,
+  "analysis": {
+    "score": 82.0,
+    "summary": "主体完整，构图稳定",
+    "suggestions": ["人物可略向左", "面部可再提亮"]
+  }
+}
+```
+
 #### `POST /api/v1/ai/angle-search/start`
 
 作用：

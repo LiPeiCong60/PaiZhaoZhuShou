@@ -4,12 +4,104 @@ AI相关路由
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import os
+import tempfile
+from typing import Literal
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from api.dependencies import require_session
-from api.session_manager import ApiSessionContext
+from api.session_manager import ApiSessionContext, session_manager
+from interfaces.ai_assistant import AIPhotoAssistant, BackgroundAnalysis, CaptureAnalysis, build_ai_assistant_from_env
 
 router = APIRouter(prefix="/api/v1/ai", tags=["AI"])
+
+
+def _resolve_upload_analysis_context() -> tuple[AIPhotoAssistant, dict[str, object], bool]:
+    session = session_manager.current_session()
+    if session is not None:
+        return session.ai_assistant, session.build_ai_context(), True
+    return build_ai_assistant_from_env(), {}, False
+
+
+def _ensure_valid_image(image_path: str) -> None:
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(image_path) as image:
+            image.verify()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("上传文件不是有效图片") from exc
+
+
+def _serialize_photo_analysis(analysis: CaptureAnalysis) -> dict:
+    return {
+        "score": analysis.score,
+        "summary": analysis.summary,
+        "suggestions": analysis.suggestions,
+    }
+
+
+def _serialize_background_analysis(analysis: BackgroundAnalysis) -> dict:
+    return {
+        "score": analysis.score,
+        "summary": analysis.summary,
+        "placement": analysis.placement,
+        "camera_angle": analysis.camera_angle,
+        "lighting": analysis.lighting,
+        "suggestions": analysis.suggestions,
+        "recommended_pan_delta": analysis.recommended_pan_delta,
+        "recommended_tilt_delta": analysis.recommended_tilt_delta,
+        "target_box_norm": list(analysis.target_box_norm),
+    }
+
+
+@router.post("/analyze-upload")
+async def analyze_uploaded_photo(
+    file: UploadFile = File(...),
+    analysis_type: Literal["photo", "background"] = "photo",
+) -> dict:
+    """上传图片并立即执行 AI 分析"""
+    suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
+    tmp_path = None
+    try:
+        raw = await file.read()
+        if not raw:
+            raise ValueError("上传图片为空")
+
+        with tempfile.NamedTemporaryFile(prefix="ai_upload_", suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.write(raw)
+
+        _ensure_valid_image(tmp_path)
+        ai_assistant, context, used_session_context = _resolve_upload_analysis_context()
+
+        if analysis_type == "background":
+            analysis = ai_assistant.analyze_background(tmp_path, context=context)
+            return {
+                "message": "上传图片分析完成",
+                "filename": file.filename,
+                "analysis_type": analysis_type,
+                "used_session_context": used_session_context,
+                "analysis": _serialize_background_analysis(analysis),
+            }
+
+        analysis = ai_assistant.analyze_capture(tmp_path, context=context)
+        return {
+            "message": "上传图片分析完成",
+            "filename": file.filename,
+            "analysis_type": analysis_type,
+            "used_session_context": used_session_context,
+            "analysis": _serialize_photo_analysis(analysis),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 @router.post("/angle-search/start")
